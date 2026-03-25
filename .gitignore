@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Poetry
+# poetry.lock
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+*.spec
+
+# PyInstaller
+*.manifest
+
+# Output from your script
+grm_output/
+
+# Input data (you likely don't want to commit guild data)
+Guild_Roster_Manager.lua
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Jupyter (just in case)
+.ipynb_checkpoints/
+
+# Coverage / testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.vscode/
