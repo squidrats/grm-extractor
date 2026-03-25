@@ -9,12 +9,32 @@ from typing import Any, NoReturn
 
 import luadata
 import pandas as pd
+
 try:
     import tkinter as tk
     from tkinter import filedialog
+
     TK_AVAILABLE = True
 except Exception:
     TK_AVAILABLE = False
+    
+
+class ProgressReporter:
+    def __init__(self, total_steps: int) -> None:
+        self.total_steps = total_steps
+        self.current_step = 0
+
+    def update(self, message: str) -> None:
+        self.current_step += 1
+        width = 30
+        ratio = self.current_step / self.total_steps
+        filled = int(width * ratio)
+        bar = "#" * filled + "-" * (width - filled)
+        percent = int(ratio * 100)
+        print(f"\r[{bar}] {percent:3d}% - {message}", end="", flush=True)
+
+    def finish(self) -> None:
+        print()
 
 
 SOURCE_FILE_OVERRIDE = None
@@ -22,15 +42,21 @@ INPUT_FILENAME = "Guild_Roster_Manager.lua"
 OUTPUT_DIRECTORY_NAME = "grm_output"
 NIL_SENTINEL = "__GRM_LUA_NIL__"
 
+WOW_RETAIL_ACCOUNT_ROOTS = [
+    Path(r"C:\Program Files (x86)\World of Warcraft\_retail_\WTF\Account"),
+    Path(r"C:\Program Files\World of Warcraft\_retail_\WTF\Account"),
+]
+
+
+def exit_with_error(message: str) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
 
 def get_app_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
-
-def exit_with_error(message: str) -> NoReturn:
-    print(message, file=sys.stderr)
-    raise SystemExit(1)
 
 
 def normalize_source_path(path_value: str) -> Path:
@@ -42,14 +68,66 @@ def normalize_source_path(path_value: str) -> Path:
     return Path(path_value).expanduser()
 
 
+def find_wow_savedvariables_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    for account_root in WOW_RETAIL_ACCOUNT_ROOTS:
+        if not account_root.exists() or not account_root.is_dir():
+            continue
+
+        for account_dir in sorted(account_root.iterdir()):
+            if not account_dir.is_dir():
+                continue
+
+            candidate = account_dir / "SavedVariables" / INPUT_FILENAME
+            if candidate.exists() and candidate.is_file():
+                candidates.append(candidate)
+
+    return candidates
+
+
+def choose_candidate_interactively(candidates: list[Path]) -> Path | None:
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        print("Found 1 WoW SavedVariables file automatically:")
+        print(f"  1. {candidates[0]}")
+        print("Using it.")
+        return candidates[0]
+
+    print("Found multiple WoW SavedVariables files:")
+    for index, candidate in enumerate(candidates, start=1):
+        account_name = candidate.parent.parent.name
+        print(f"  {index}. Account {account_name}: {candidate}")
+
+    while True:
+        response = input(f"Select an account [1-{len(candidates)}] or press Enter to cancel: ").strip()
+
+        if response == "":
+            return None
+
+        if response.isdigit():
+            choice = int(response)
+            if 1 <= choice <= len(candidates):
+                return candidates[choice - 1]
+
+        print("Invalid selection. Please try again.")
+
+
 def prompt_for_source_file() -> Path | None:
     if not TK_AVAILABLE:
-        print("File not found and GUI file picker is not available.")
         return None
 
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
+
+    initial_dir = None
+    for candidate_root in WOW_RETAIL_ACCOUNT_ROOTS:
+        if candidate_root.exists():
+            initial_dir = str(candidate_root)
+            break
 
     selected_file = filedialog.askopenfilename(
         title="Select Guild_Roster_Manager.lua",
@@ -57,6 +135,7 @@ def prompt_for_source_file() -> Path | None:
             ("Lua files", "*.lua"),
             ("All files", "*.*"),
         ],
+        initialdir=initial_dir,
         initialfile=INPUT_FILENAME,
     )
 
@@ -85,43 +164,35 @@ def resolve_source_file() -> Path:
     if source_file.exists() and source_file.is_file():
         return source_file
 
+    print(f"{INPUT_FILENAME} was not found next to this program.")
+    print()
+    print("It is usually located under a path like:")
+    print(r"C:\Program Files (x86)\World of Warcraft\_retail_\WTF\Account\<ACCOUNT>\SavedVariables\Guild_Roster_Manager.lua")
+    print()
+
+    wow_candidates = find_wow_savedvariables_candidates()
+    selected_candidate = choose_candidate_interactively(wow_candidates)
+
+    if selected_candidate is not None:
+        return selected_candidate
+
+    selected_file = prompt_for_source_file()
+
+    if selected_file is not None:
+        if selected_file.exists() and selected_file.is_file():
+            return selected_file
+        exit_with_error(f"Selected file is invalid: {selected_file}")
+
     if TK_AVAILABLE:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-
-        selected_file = filedialog.askopenfilename(
-            title="Select Guild_Roster_Manager.lua",
-            filetypes=[
-                ("Lua files", "*.lua"),
-                ("All files", "*.*"),
-            ],
-            initialfile=INPUT_FILENAME,
-        )
-
-        root.destroy()
-
-        if selected_file:
-            selected_path = Path(selected_file)
-
-            if selected_path.exists() and selected_path.is_file():
-                return selected_path
-
-            exit_with_error(f"Selected file is invalid: {selected_path}")
-
         exit_with_error(
-            f"{INPUT_FILENAME} not found in current directory and no file was selected."
+            f"{INPUT_FILENAME} was not found automatically and no file was selected."
         )
 
     exit_with_error(
-        f"{INPUT_FILENAME} not found in current directory.\n"
-        "No GUI file picker available in this environment.\n"
-        "Either:\n"
-        "  - Place the file next to the script\n"
-        "  - Or set SOURCE_FILE_OVERRIDE to the full path"
+        f"{INPUT_FILENAME} was not found automatically.\n"
+        "No GUI file picker is available in this environment.\n"
+        "Place the file next to the program or set SOURCE_FILE_OVERRIDE."
     )
-
-    raise RuntimeError("Unreachable")
 
 
 def read_input_file() -> tuple[Path, str]:
@@ -419,11 +490,33 @@ def collect_guild_keys(dataset: Any) -> list[str]:
 
 
 def main() -> None:
-    source_file, raw_text = read_input_file()
+    progress = ProgressReporter(total_steps=13)
+
+    progress.update("Locating source file")
+    source_file = resolve_source_file()
+
+    progress.update("Reading input file")
+    try:
+        raw_text = source_file.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        exit_with_error(f"Unable to read {source_file}: {exc}")
+
+    required_markers = [
+        "GRM_GuildMemberHistory_Save",
+        "GRM_PlayersThatLeftHistory_Save",
+        "GRM_LogReport_Save",
+    ]
+
+    if not any(marker in raw_text for marker in required_markers):
+        exit_with_error(f"{source_file} does not appear to be a Guild Roster Manager SavedVariables file")
+
     output_directory = get_app_directory() / OUTPUT_DIRECTORY_NAME
     output_directory.mkdir(parents=True, exist_ok=True)
 
+    progress.update("Splitting top-level Lua assignments")
     assignments = split_top_level_assignments(raw_text)
+
+    progress.update("Parsing Lua data")
     parsed = parse_lua_assignments(assignments)
 
     members_data = parsed.get("GRM_GuildMemberHistory_Save", {})
@@ -432,16 +525,34 @@ def main() -> None:
     alts_data = parsed.get("GRM_Alts", {})
     alt_flags_data = parsed.get("GRM_PlayerListOfAlts_Save", {})
 
+    progress.update("Extracting current members")
     members_rows = extract_members(members_data, "current_member")
+
+    progress.update("Extracting former members")
     former_members_rows = extract_members(former_members_data, "former_member")
+
+    progress.update("Extracting logs")
     logs_rows = extract_logs(logs_data)
+
+    progress.update("Extracting alt groups")
     alts_rows = extract_alts(alts_data)
+
+    progress.update("Extracting alt flags")
     alt_flags_rows = extract_alt_flags(alt_flags_data)
 
+    progress.update("Writing members.csv")
     write_csv(output_directory, "members.csv", members_rows)
+
+    progress.update("Writing former_members.csv")
     write_csv(output_directory, "former_members.csv", former_members_rows)
+
+    progress.update("Writing logs.csv")
     write_csv(output_directory, "logs.csv", logs_rows)
+
+    progress.update("Writing alts.csv")
     write_csv(output_directory, "alts.csv", alts_rows)
+
+    progress.update("Writing alt_flags.csv")
     write_csv(output_directory, "alt_flags.csv", alt_flags_rows)
 
     manifest = {
@@ -468,11 +579,17 @@ def main() -> None:
         },
     }
 
+    progress.update("Writing manifest")
     write_json(output_directory, "_manifest.json", manifest)
 
+    progress.finish()
+
+    print()
     print(f"Source: {source_file}")
     print(f"Output: {output_directory}")
     print(json.dumps(manifest["row_counts"], indent=2))
+    print()
+    input("Done. Press Enter to exit...")
 
 
 if __name__ == "__main__":
