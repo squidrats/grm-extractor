@@ -86,7 +86,11 @@ def find_wow_savedvariables_candidates() -> list[Path]:
             if candidate.exists() and candidate.is_file():
                 candidates.append(candidate)
 
-    return candidates
+        root_level_candidate = account_root / "SavedVariables" / INPUT_FILENAME
+        if root_level_candidate.exists() and root_level_candidate.is_file():
+            candidates.append(root_level_candidate)
+
+    return sorted(set(candidates))
 
 
 def choose_candidate_interactively(candidates: list[Path]) -> Path | None:
@@ -101,7 +105,7 @@ def choose_candidate_interactively(candidates: list[Path]) -> Path | None:
 
     print("Found multiple WoW SavedVariables files:")
     for index, candidate in enumerate(candidates, start=1):
-        account_name = candidate.parent.parent.name
+        account_name = infer_account_name_from_path(candidate)
         print(f"  {index}. Account {account_name}: {candidate}")
 
     while True:
@@ -150,7 +154,18 @@ def prompt_for_source_file() -> Path | None:
     return Path(selected_file)
 
 
-def resolve_source_file() -> Path:
+def infer_account_name_from_path(path: Path) -> str:
+    parts = list(path.parts)
+    if "Account" in parts:
+        account_index = parts.index("Account")
+        if account_index + 1 < len(parts):
+            account_name = parts[account_index + 1]
+            if account_name != "SavedVariables":
+                return account_name
+    return "manual"
+
+
+def resolve_source_files() -> list[Path]:
     if SOURCE_FILE_OVERRIDE is not None:
         source_file = normalize_source_path(SOURCE_FILE_OVERRIDE)
 
@@ -160,30 +175,41 @@ def resolve_source_file() -> Path:
         if not source_file.is_file():
             exit_with_error(f"Input path is not a file (override): {source_file}")
 
-        return source_file
+        return [source_file]
 
-    source_file = get_app_directory() / INPUT_FILENAME
-
-    if source_file.exists() and source_file.is_file():
-        return source_file
+    same_directory_file = get_app_directory() / INPUT_FILENAME
+    if same_directory_file.exists() and same_directory_file.is_file():
+        return [same_directory_file]
 
     print(f"{INPUT_FILENAME} was not found next to this program.")
     print()
-    print("It is usually located under a path like:")
+    print("It is usually located under paths like:")
     print(r"C:\Program Files (x86)\World of Warcraft\_retail_\WTF\Account\<ACCOUNT>\SavedVariables\Guild_Roster_Manager.lua")
+    print()
+    print("This build will try to load ALL account files it can find.")
     print()
 
     wow_candidates = find_wow_savedvariables_candidates()
-    selected_candidate = choose_candidate_interactively(wow_candidates)
 
-    if selected_candidate is not None:
-        return selected_candidate
+    if wow_candidates:
+        print("Found these account files:")
+        for candidate in wow_candidates:
+            print(f"  - {infer_account_name_from_path(candidate)}: {candidate}")
+        print()
+        use_all = input("Use all detected account files? [Y/n]: ").strip().lower()
+
+        if use_all in ("", "y", "yes"):
+            return wow_candidates
+
+        selected_candidate = choose_candidate_interactively(wow_candidates)
+        if selected_candidate is not None:
+            return [selected_candidate]
 
     selected_file = prompt_for_source_file()
 
     if selected_file is not None:
         if selected_file.exists() and selected_file.is_file():
-            return selected_file
+            return [selected_file]
         exit_with_error(f"Selected file is invalid: {selected_file}")
 
     if TK_AVAILABLE:
@@ -387,6 +413,108 @@ def safe_get_list_value(value: Any, index: int) -> Any:
     return None
 
 
+def merge_dict_of_dicts_with_account(parsed_files: list[dict[str, Any]], variable_name: str) -> dict[str, dict[str, dict[str, Any]]]:
+    merged: dict[str, dict[str, dict[str, Any]]] = {}
+
+    for file_entry in parsed_files:
+        source_account = file_entry["source_account"]
+        parsed = file_entry["parsed"]
+        dataset = parsed.get(variable_name, {})
+
+        if not isinstance(dataset, dict):
+            continue
+
+        for guild_key, guild_members in dataset.items():
+            if not isinstance(guild_members, dict):
+                continue
+
+            merged.setdefault(guild_key, {})
+
+            for player_key, record in guild_members.items():
+                if not isinstance(record, dict):
+                    continue
+
+                enriched_record = dict(record)
+                enriched_record["_source_account"] = source_account
+                merged[guild_key][player_key] = enriched_record
+
+    return merged
+
+
+def merge_dict_of_lists_with_account(parsed_files: list[dict[str, Any]], variable_name: str) -> dict[str, list[Any]]:
+    merged: dict[str, list[Any]] = defaultdict(list)
+
+    for file_entry in parsed_files:
+        source_account = file_entry["source_account"]
+        parsed = file_entry["parsed"]
+        dataset = parsed.get(variable_name, {})
+
+        if not isinstance(dataset, dict):
+            continue
+
+        for guild_key, guild_records in dataset.items():
+            if not isinstance(guild_records, list):
+                continue
+
+            for record in guild_records:
+                if isinstance(record, list):
+                    merged[guild_key].append(record + [source_account])
+                else:
+                    merged[guild_key].append(record)
+
+    return dict(merged)
+
+
+def merge_alt_groups_with_account(parsed_files: list[dict[str, Any]], variable_name: str) -> dict[str, dict[Any, dict[str, Any]]]:
+    merged: dict[str, dict[Any, dict[str, Any]]] = defaultdict(dict)
+
+    for file_entry in parsed_files:
+        source_account = file_entry["source_account"]
+        parsed = file_entry["parsed"]
+        dataset = parsed.get(variable_name, {})
+
+        if not isinstance(dataset, dict):
+            continue
+
+        for guild_key, guild_groups in dataset.items():
+            if not isinstance(guild_groups, dict):
+                continue
+
+            for alt_group_id, alt_group_record in guild_groups.items():
+                if not isinstance(alt_group_record, dict):
+                    continue
+
+                enriched = dict(alt_group_record)
+                enriched["_source_account"] = source_account
+                merged[guild_key][f"{source_account}:{alt_group_id}"] = enriched
+
+    return dict(merged)
+
+
+def merge_alt_flags_with_account(parsed_files: list[dict[str, Any]], variable_name: str) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = defaultdict(dict)
+
+    for file_entry in parsed_files:
+        source_account = file_entry["source_account"]
+        parsed = file_entry["parsed"]
+        dataset = parsed.get(variable_name, {})
+
+        if not isinstance(dataset, dict):
+            continue
+
+        for guild_key, guild_flags in dataset.items():
+            if not isinstance(guild_flags, dict):
+                continue
+
+            for player_key, flag_value in guild_flags.items():
+                merged[guild_key][player_key] = {
+                    "_source_account": source_account,
+                    "_flag_value": flag_value,
+                }
+
+    return dict(merged)
+
+
 def extract_member_rows(dataset: Any, record_type: str, snapshot_time: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
 
@@ -409,6 +537,7 @@ def extract_member_rows(dataset: Any, record_type: str, snapshot_time: str) -> l
                 "player_key": player_key,
                 "player_id": player_id,
                 "record_type": record_type,
+                "source_account": member_record.get("_source_account"),
             }
 
             row = flatten_record(base_fields, member_record)
@@ -447,6 +576,7 @@ def extract_rank_history(dataset: Any, membership_status: str) -> list[dict[str,
 
                 rows.append(
                     {
+                        "source_account": member_record.get("_source_account"),
                         "guild_key": guild_key,
                         "player_key": player_key,
                         "player_id": player_id,
@@ -494,6 +624,7 @@ def extract_join_history(dataset: Any, membership_status: str) -> list[dict[str,
 
                 rows.append(
                     {
+                        "source_account": member_record.get("_source_account"),
                         "guild_key": guild_key,
                         "player_key": player_key,
                         "player_id": player_id,
@@ -543,19 +674,23 @@ def extract_fact_events(dataset: Any) -> tuple[
             if not isinstance(record, list):
                 continue
 
-            event_code = record[0] if len(record) > 0 else None
+            appended_source_account = record[-1] if len(record) > 0 and isinstance(record[-1], str) and "#" in record[-1] else None
+            core_record = record[:-1] if appended_source_account is not None else record
+
+            event_code = core_record[0] if len(core_record) > 0 else None
             event_type = classify_event(event_code)
-            message = record[1] if len(record) > 1 else None
-            actor, target = parse_actor_target(record)
+            message = core_record[1] if len(core_record) > 1 else None
+            actor, target = parse_actor_target(core_record)
 
             event_time = None
-            for value in record:
+            for value in core_record:
                 possible_time = parse_datetime_tuple(value)
                 if possible_time is not None:
                     event_time = possible_time
                     break
 
             base_event = {
+                "source_account": appended_source_account,
                 "guild_key": guild_key,
                 "event_index": event_index,
                 "event_code": event_code,
@@ -564,7 +699,7 @@ def extract_fact_events(dataset: Any) -> tuple[
                 "target": target,
                 "message": message,
                 "event_time": event_time,
-                "raw_record_json": serialize_nested_value(record),
+                "raw_record_json": serialize_nested_value(core_record),
             }
 
             events.append(base_event)
@@ -575,8 +710,8 @@ def extract_fact_events(dataset: Any) -> tuple[
                         **base_event,
                         "invited_by": actor,
                         "joined_player": target,
-                        "join_level": record[7] if len(record) > 7 else None,
-                        "unknown_flag": record[6] if len(record) > 6 else None,
+                        "join_level": core_record[7] if len(core_record) > 7 else None,
+                        "unknown_flag": core_record[6] if len(core_record) > 6 else None,
                     }
                 )
 
@@ -594,8 +729,8 @@ def extract_fact_events(dataset: Any) -> tuple[
                         **base_event,
                         "changed_by": actor,
                         "player_promoted": target,
-                        "old_rank": record[5] if len(record) > 5 else None,
-                        "new_rank": record[6] if len(record) > 6 else None,
+                        "old_rank": core_record[5] if len(core_record) > 5 else None,
+                        "new_rank": core_record[6] if len(core_record) > 6 else None,
                     }
                 )
 
@@ -605,8 +740,8 @@ def extract_fact_events(dataset: Any) -> tuple[
                         **base_event,
                         "changed_by": actor,
                         "player_demoted": target,
-                        "old_rank": record[5] if len(record) > 5 else None,
-                        "new_rank": record[6] if len(record) > 6 else None,
+                        "old_rank": core_record[5] if len(core_record) > 5 else None,
+                        "new_rank": core_record[6] if len(core_record) > 6 else None,
                     }
                 )
 
@@ -614,9 +749,9 @@ def extract_fact_events(dataset: Any) -> tuple[
                 note_changes.append(
                     {
                         **base_event,
-                        "player_changed": normalize_player_name(record[2]) if len(record) > 2 else actor,
-                        "old_note": normalize_player_name(record[3]) if len(record) > 3 else None,
-                        "new_note": normalize_player_name(record[4]) if len(record) > 4 else None,
+                        "player_changed": normalize_player_name(core_record[2]) if len(core_record) > 2 else actor,
+                        "old_note": normalize_player_name(core_record[3]) if len(core_record) > 3 else None,
+                        "new_note": normalize_player_name(core_record[4]) if len(core_record) > 4 else None,
                     }
                 )
 
@@ -624,9 +759,9 @@ def extract_fact_events(dataset: Any) -> tuple[
                 officer_note_changes.append(
                     {
                         **base_event,
-                        "player_changed": normalize_player_name(record[2]) if len(record) > 2 else actor,
-                        "old_officer_note": normalize_player_name(record[3]) if len(record) > 3 else None,
-                        "new_officer_note": normalize_player_name(record[4]) if len(record) > 4 else None,
+                        "player_changed": normalize_player_name(core_record[2]) if len(core_record) > 2 else actor,
+                        "old_officer_note": normalize_player_name(core_record[3]) if len(core_record) > 3 else None,
+                        "new_officer_note": normalize_player_name(core_record[4]) if len(core_record) > 4 else None,
                     }
                 )
 
@@ -635,8 +770,8 @@ def extract_fact_events(dataset: Any) -> tuple[
                     {
                         **base_event,
                         "player_changed": target,
-                        "old_rank": record[5] if len(record) > 5 else None,
-                        "new_rank": record[6] if len(record) > 6 else None,
+                        "old_rank": core_record[5] if len(core_record) > 5 else None,
+                        "new_rank": core_record[6] if len(core_record) > 6 else None,
                     }
                 )
 
@@ -661,6 +796,7 @@ def extract_alt_group_members(dataset: Any) -> list[dict[str, Any]]:
             nickname_details = alt_group_record.get("nicknameDetails")
             birthday_info = alt_group_record.get("birthdayInfo")
             time_modified = alt_group_record.get("timeModified")
+            source_account = alt_group_record.get("_source_account")
 
             numeric_member_entries = sorted(
                 (key, value)
@@ -671,6 +807,7 @@ def extract_alt_group_members(dataset: Any) -> list[dict[str, Any]]:
             for member_index, member_value in numeric_member_entries:
                 rows.append(
                     {
+                        "source_account": source_account,
                         "guild_key": guild_key,
                         "alt_group_id": alt_group_id,
                         "member_index": member_index,
@@ -697,9 +834,13 @@ def extract_alt_flags(dataset: Any) -> list[dict[str, Any]]:
         if not isinstance(guild_flags, dict):
             continue
 
-        for player_key, flag_value in guild_flags.items():
+        for player_key, flag_payload in guild_flags.items():
+            source_account = flag_payload.get("_source_account") if isinstance(flag_payload, dict) else None
+            flag_value = flag_payload.get("_flag_value") if isinstance(flag_payload, dict) else None
+
             rows.append(
                 {
+                    "source_account": source_account,
                     "guild_key": guild_key,
                     "player_key": player_key,
                     "player_name_clean": normalize_player_name(player_key),
@@ -718,13 +859,14 @@ def build_dim_players(current_members: list[dict[str, Any]], former_members: lis
         player_id = row.get("player_id")
         player_key = row.get("player_key")
 
-        unique_key = player_id or player_key
+        unique_key = player_id or f"{row.get('source_account')}::{player_key}"
         if unique_key is None:
             continue
 
         existing = players_by_key.get(unique_key, {})
 
         merged = {
+            "source_account": row.get("source_account"),
             "player_id": player_id,
             "player_key": player_key,
             "name": row.get("name"),
@@ -803,6 +945,7 @@ def build_fact_daily_snapshot(current_members: list[dict[str, Any]], snapshot_ti
     for row in current_members:
         rows.append(
             {
+                "source_account": row.get("source_account"),
                 "snapshot_time": snapshot_time,
                 "snapshot_date": snapshot_time[:10],
                 "guild_key": row.get("guild_key"),
@@ -813,7 +956,7 @@ def build_fact_daily_snapshot(current_members: list[dict[str, Any]], snapshot_ti
                 "level": row.get("level"),
                 "class": row.get("class"),
                 "zone": row.get("zone"),
-                "last_online_days": row.get("lastOnline"),
+                "last_online_days": row.get("last_online_days"),
                 "is_online": row.get("isOnline"),
                 "achievement_points": row.get("achievementPoints"),
                 "mythic_score": row.get("MythicScore"),
@@ -870,16 +1013,17 @@ def build_fact_daily_guild_snapshot(fact_daily_snapshot_rows: list[dict[str, Any
 
 def build_bridge_player_guild(current_members: list[dict[str, Any]], former_members: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    seen: set[tuple[Any, Any, Any]] = set()
+    seen: set[tuple[Any, Any, Any, Any]] = set()
 
     for row in current_members + former_members:
-        key = (row.get("player_id"), row.get("player_key"), row.get("guild_key"))
+        key = (row.get("source_account"), row.get("player_id"), row.get("player_key"), row.get("guild_key"))
         if key in seen:
             continue
         seen.add(key)
 
         rows.append(
             {
+                "source_account": row.get("source_account"),
                 "player_id": row.get("player_id"),
                 "player_key": row.get("player_key"),
                 "guild_key": row.get("guild_key"),
@@ -888,6 +1032,20 @@ def build_bridge_player_guild(current_members: list[dict[str, Any]], former_memb
         )
 
     return rows
+
+
+def dedupe_rows(rows: list[dict[str, Any]], key_fields: list[str]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    for row in rows:
+        key = tuple(row.get(field) for field in key_fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    return deduped
 
 
 def write_json(output_directory: Path, filename: str, data: Any) -> None:
@@ -909,42 +1067,67 @@ def collect_guild_keys(dataset: Any) -> list[str]:
 
 
 def main() -> None:
-    progress = ProgressReporter(total_steps=28)
+    progress = ProgressReporter(total_steps=34)
     snapshot_time = datetime.now().isoformat(timespec="seconds")
 
-    progress.update("Locating source file")
-    source_file = resolve_source_file()
+    progress.update("Locating source files")
+    source_files = resolve_source_files()
 
-    progress.update("Reading input file")
-    try:
-        raw_text = source_file.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        exit_with_error(f"Unable to read {source_file}: {exc}")
+    progress.update("Reading source files")
+    parsed_files: list[dict[str, Any]] = []
+    parse_errors_by_file: dict[str, dict[str, Any]] = {}
 
-    required_markers = [
-        "GRM_GuildMemberHistory_Save",
-        "GRM_PlayersThatLeftHistory_Save",
-        "GRM_LogReport_Save",
-    ]
+    for source_file in source_files:
+        try:
+            raw_text = source_file.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            exit_with_error(f"Unable to read {source_file}: {exc}")
 
-    if not any(marker in raw_text for marker in required_markers):
-        exit_with_error(f"{source_file} does not appear to be a Guild Roster Manager SavedVariables file")
+        required_markers = [
+            "GRM_GuildMemberHistory_Save",
+            "GRM_PlayersThatLeftHistory_Save",
+            "GRM_LogReport_Save",
+        ]
 
-    timestamp = datetime.now().strftime("%Y-%m-%d")
-    output_directory = get_app_directory() / OUTPUT_DIRECTORY_NAME / timestamp
+        if not any(marker in raw_text for marker in required_markers):
+            exit_with_error(f"{source_file} does not appear to be a Guild Roster Manager SavedVariables file")
+
+        assignments = split_top_level_assignments(raw_text)
+        parsed = parse_lua_assignments(assignments)
+        source_account = infer_account_name_from_path(source_file)
+
+        parsed_files.append(
+            {
+                "source_file": source_file,
+                "source_account": source_account,
+                "assignments": assignments,
+                "parsed": parsed,
+            }
+        )
+
+        parse_errors_by_file[str(source_file)] = {
+            key: value
+            for key, value in parsed.items()
+            if isinstance(value, dict) and "__parse_error__" in value
+        }
+
+    output_directory = get_app_directory() / OUTPUT_DIRECTORY_NAME
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    progress.update("Splitting top-level Lua assignments")
-    assignments = split_top_level_assignments(raw_text)
+    progress.update("Merging member history")
+    members_data = merge_dict_of_dicts_with_account(parsed_files, "GRM_GuildMemberHistory_Save")
 
-    progress.update("Parsing Lua data")
-    parsed = parse_lua_assignments(assignments)
+    progress.update("Merging former member history")
+    former_members_data = merge_dict_of_dicts_with_account(parsed_files, "GRM_PlayersThatLeftHistory_Save")
 
-    members_data = parsed.get("GRM_GuildMemberHistory_Save", {})
-    former_members_data = parsed.get("GRM_PlayersThatLeftHistory_Save", {})
-    logs_data = parsed.get("GRM_LogReport_Save", {})
-    alts_data = parsed.get("GRM_Alts", {})
-    alt_flags_data = parsed.get("GRM_PlayerListOfAlts_Save", {})
+    progress.update("Merging logs")
+    logs_data = merge_dict_of_lists_with_account(parsed_files, "GRM_LogReport_Save")
+
+    progress.update("Merging alt groups")
+    alts_data = merge_alt_groups_with_account(parsed_files, "GRM_Alts")
+
+    progress.update("Merging alt flags")
+    alt_flags_data = merge_alt_flags_with_account(parsed_files, "GRM_PlayerListOfAlts_Save")
 
     progress.update("Extracting current members")
     members_rows = extract_member_rows(members_data, "current_member", snapshot_time)
@@ -958,7 +1141,7 @@ def main() -> None:
     progress.update("Extracting join history")
     join_history_rows = extract_join_history(members_data, "current_member") + extract_join_history(former_members_data, "former_member")
 
-    progress.update("Extracting structured event facts")
+    progress.update("Extracting event facts")
     fact_events_rows, fact_joins_rows, fact_promotions_rows, fact_demotions_rows, fact_note_changes_rows, fact_officer_note_changes_rows, fact_rank_changes_rows, fact_leaves_rows = extract_fact_events(logs_data)
 
     progress.update("Extracting alt group relationships")
@@ -966,6 +1149,22 @@ def main() -> None:
 
     progress.update("Extracting alt flags")
     alt_flags_rows = extract_alt_flags(alt_flags_data)
+
+    progress.update("Deduplicating primary entities")
+    members_rows = dedupe_rows(members_rows, ["source_account", "guild_key", "player_key"])
+    former_members_rows = dedupe_rows(former_members_rows, ["source_account", "guild_key", "player_key"])
+    rank_history_rows = dedupe_rows(rank_history_rows, ["source_account", "guild_key", "player_key", "history_sequence", "rank_name", "timestamp_epoch"])
+    join_history_rows = dedupe_rows(join_history_rows, ["source_account", "guild_key", "player_key", "history_sequence", "timestamp_epoch"])
+    fact_events_rows = dedupe_rows(fact_events_rows, ["source_account", "guild_key", "event_code", "message", "event_time"])
+    fact_joins_rows = dedupe_rows(fact_joins_rows, ["source_account", "guild_key", "joined_player", "event_time"])
+    fact_promotions_rows = dedupe_rows(fact_promotions_rows, ["source_account", "guild_key", "player_promoted", "event_time", "old_rank", "new_rank"])
+    fact_demotions_rows = dedupe_rows(fact_demotions_rows, ["source_account", "guild_key", "player_demoted", "event_time", "old_rank", "new_rank"])
+    fact_note_changes_rows = dedupe_rows(fact_note_changes_rows, ["source_account", "guild_key", "player_changed", "event_time", "old_note", "new_note"])
+    fact_officer_note_changes_rows = dedupe_rows(fact_officer_note_changes_rows, ["source_account", "guild_key", "player_changed", "event_time", "old_officer_note", "new_officer_note"])
+    fact_rank_changes_rows = dedupe_rows(fact_rank_changes_rows, ["source_account", "guild_key", "player_changed", "event_time", "old_rank", "new_rank"])
+    fact_leaves_rows = dedupe_rows(fact_leaves_rows, ["source_account", "guild_key", "player_left", "event_time"])
+    dim_alt_groups_rows = dedupe_rows(dim_alt_groups_rows, ["source_account", "guild_key", "alt_group_id", "alt_name"])
+    alt_flags_rows = dedupe_rows(alt_flags_rows, ["source_account", "guild_key", "player_key"])
 
     progress.update("Building dim_players")
     dim_players_rows = build_dim_players(members_rows, former_members_rows)
@@ -1045,11 +1244,20 @@ def main() -> None:
     progress.update("Writing fact_daily_guild_snapshot.csv")
     write_csv(output_directory, "fact_daily_guild_snapshot.csv", fact_daily_guild_snapshot_rows)
 
+    all_top_level_variables = sorted(
+        {
+            variable_name
+            for file_entry in parsed_files
+            for variable_name in file_entry["assignments"].keys()
+        }
+    )
+
     manifest = {
-        "source_file": str(source_file),
+        "source_files": [str(path) for path in source_files],
+        "source_accounts": [infer_account_name_from_path(path) for path in source_files],
         "output_directory": str(output_directory),
         "generated_at": snapshot_time,
-        "top_level_variables_found": sorted(assignments.keys()),
+        "top_level_variables_found": all_top_level_variables,
         "guilds_in_members": collect_guild_keys(members_data),
         "guilds_in_former_members": collect_guild_keys(former_members_data),
         "guilds_in_logs": collect_guild_keys(logs_data),
@@ -1077,11 +1285,7 @@ def main() -> None:
             "fact_daily_snapshot": len(fact_daily_snapshot_rows),
             "fact_daily_guild_snapshot": len(fact_daily_guild_snapshot_rows),
         },
-        "parse_errors": {
-            key: value
-            for key, value in parsed.items()
-            if isinstance(value, dict) and "__parse_error__" in value
-        },
+        "parse_errors_by_file": parse_errors_by_file,
     }
 
     write_json(output_directory, "_manifest.json", manifest)
@@ -1089,13 +1293,17 @@ def main() -> None:
     progress.finish()
 
     print()
-    print(f"Source: {source_file}")
+    print("Source files:")
+    for path in source_files:
+        print(f"  - {path}")
+    print()
     print(f"Output: {output_directory}")
     print()
     print(json.dumps(manifest["row_counts"], indent=2))
     print()
 
-    if manifest["parse_errors"]:
+    has_any_parse_errors = any(bool(errors) for errors in parse_errors_by_file.values())
+    if has_any_parse_errors:
         print("Some top-level GRM variables had parse errors. See _manifest.json for details.")
         print()
 
